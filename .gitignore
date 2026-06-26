@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+checkpoints/
+*.egg-info/
+.hf_cache/
+.claude/
+wandb/
+wandb.key
+*_run.log

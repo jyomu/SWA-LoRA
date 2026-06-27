@@ -1,10 +1,14 @@
-"""Adaptive SWA-window curriculum.
+"""Adaptive, success-gated SWA-window curriculum.
 
-Instead of training LoRA directly at the target (harsh) window, start at a
-window wide enough to show ~no degradation vs the full-attention teacher,
-train a chunk of steps, confirm retrieval capability is preserved, then
-shrink the window and repeat. This finds where the "relay" capability
-actually breaks down rather than guessing a single target window upfront.
+Train at the current window; periodically check whether passkey retrieval
+succeeds at the relay-required distance (window * --relay-ratio). Only once
+it succeeds do we shrink the window (by --window-decay) and continue -- if
+it never succeeds within --max-steps-per-window, we stop there, since that
+window is the boundary where relay capability breaks down. This replaces an
+earlier fixed (window, steps) schedule with one that advances only as fast
+as the model actually demonstrates the capability we care about, and with
+much finer (continuous) window steps since we're no longer pre-committing a
+fixed step budget per window.
 """
 
 import argparse
@@ -33,6 +37,18 @@ def iter_long_documents(dataset_name, dataset_config, split, text_column, min_ch
         text = example[text_column]
         if len(text.strip()) >= min_chars:
             yield text
+
+
+def planned_window_schedule(start: int, window_min: int, decay: float) -> list[int]:
+    """The window sizes a fully-successful run would pass through -- used only
+    to size the teacher baseline eval, since the actual run may stop early."""
+    windows = [start]
+    while windows[-1] > window_min:
+        nxt = max(window_min, round(windows[-1] * decay))
+        if nxt == windows[-1]:
+            break
+        windows.append(nxt)
+    return windows
 
 
 def make_mixed_batches(
@@ -104,13 +120,49 @@ def make_mixed_batches(
     return input_ids, None
 
 
+def next_training_batch(tokenizer, doc_iter, seq_length, batch_size, device, window, synthetic_ratio, synth_rng, build_labels):
+    batch, labels = make_mixed_batches(
+        tokenizer,
+        doc_iter,
+        seq_length,
+        num_batches=1,
+        batch_size=batch_size,
+        device=device,
+        window=window,
+        synthetic_ratio=synthetic_ratio,
+        synth_rng=synth_rng,
+        build_labels=build_labels,
+    )
+    return batch[0], (labels[0] if labels is not None else None)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name", default="Qwen/Qwen3-0.6B-Base")
     parser.add_argument("--sequence-length", type=int, default=2048)
     parser.add_argument("--num-full-top-layers", type=int, default=1)
-    parser.add_argument("--windows", type=int, nargs="+", default=[2048, 1024, 512, 256, 128])
-    parser.add_argument("--steps-per-window", type=int, default=200)
+    parser.add_argument("--window-start", type=int, default=2048)
+    parser.add_argument("--window-min", type=int, default=64)
+    parser.add_argument("--window-decay", type=float, default=0.85, help="window *= this once the current window succeeds")
+    parser.add_argument(
+        "--relay-ratio",
+        type=float,
+        default=2.0,
+        help="success is measured at distance = window * relay_ratio (must be > 1, i.e. genuinely relay-required)",
+    )
+    parser.add_argument(
+        "--success-threshold",
+        type=float,
+        default=0.6,
+        help="passkey accuracy at the relay-required distance needed to advance to the next (smaller) window",
+    )
+    parser.add_argument("--eval-every", type=int, default=50, help="check for success every N steps within a window")
+    parser.add_argument(
+        "--max-steps-per-window",
+        type=int,
+        default=400,
+        help="give up on this window (and stop the whole curriculum -- this is the boundary) if no success within this many steps",
+    )
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--include-mlp-lora", action="store_true")
@@ -167,11 +219,10 @@ def main():
         with open(args.metrics_out, "w") as f:
             json.dump(history, f, indent=2)
 
-    # Build with the widest window in the schedule -- that's the starting point.
     setup = build_pretrained_setup(
         model_name=args.model_name,
         num_full_top_layers=args.num_full_top_layers,
-        sliding_window=args.windows[0],
+        sliding_window=args.window_start,
         device=args.device,
     )
     print("layer_types:", setup.policy.layer_types)
@@ -186,9 +237,11 @@ def main():
     )
     eval_texts = [next(doc_iter) for _ in range(args.num_eval_docs)]
 
-    # Evaluate the teacher once at every distance any stage will use, so each
-    # stage's passkey result has a directly comparable reference.
-    all_distances = sorted({d for window in args.windows for d in distances_for_window(window)})
+    # Evaluate the teacher once at every distance a fully-successful run could
+    # reach, so each checkpoint's passkey result has a directly comparable
+    # reference even though the real run may stop earlier.
+    planned_windows = planned_window_schedule(args.window_start, args.window_min, args.window_decay)
+    all_distances = sorted({d for window in planned_windows for d in distances_for_window(window)})
 
     ppl_teacher = compute_perplexity(
         setup.teacher, setup.tokenizer, eval_texts, args.device, max_length=args.sequence_length
@@ -240,69 +293,107 @@ def main():
     out_dir = Path(args.output_dir)
     global_step = 0
     synth_rng = random.Random(args.synthetic_seed)
+    build_labels = args.lambda_ce > 0
+    window = args.window_start
 
-    for window in args.windows:
-        print(f"=== Stage: window={window} (starting at global_step={global_step}) ===")
+    while True:
+        print(f"=== Window={window} (starting at global_step={global_step}) ===")
         setup.adapter.set_sliding_window(student, window)
-
-        train_batches, train_labels = make_mixed_batches(
-            setup.tokenizer,
-            doc_iter,
-            args.sequence_length,
-            args.steps_per_window,
-            args.batch_size,
-            args.device,
-            window,
-            synthetic_ratio=args.synthetic_ratio,
-            synth_rng=synth_rng,
-            build_labels=args.lambda_ce > 0,
-        )
-        label_iter = train_labels if train_labels is not None else [None] * len(train_batches)
-
+        relay_distance = round(window * args.relay_ratio)
+        step_in_window = 0
         stage_loss = []
-        for batch, label_batch in zip(train_batches, label_iter):
+        checks = []
+        outcome = None
+
+        while True:
+            batch, label_batch = next_training_batch(
+                setup.tokenizer,
+                doc_iter,
+                args.sequence_length,
+                args.batch_size,
+                args.device,
+                window,
+                args.synthetic_ratio,
+                synth_rng,
+                build_labels,
+            )
             metrics = trainer.train_step(input_ids=batch, labels=label_batch)
             scalars = {k: (v.item() if torch.is_tensor(v) else v) for k, v in metrics.items()}
             stage_loss.append({"global_step": global_step, **scalars})
             global_step += 1
+            step_in_window += 1
             if use_wandb:
                 wandb.log({"train/window": window, **{f"train/{k}": v for k, v in scalars.items()}}, step=global_step)
             if global_step % args.log_every == 0:
                 print(global_step, scalars)
 
-        ppl_now = compute_perplexity(
-            student, setup.tokenizer, eval_texts, args.device, max_length=args.sequence_length
-        )
+            if step_in_window % args.eval_every == 0:
+                ppl_now = compute_perplexity(
+                    student, setup.tokenizer, eval_texts, args.device, max_length=args.sequence_length
+                )
+                check_distances = distances_for_window(window)
+                passkey_now = passkey_retrieval_eval(
+                    student, setup.tokenizer, args.device, distances=check_distances, num_samples=5
+                )
+                success_acc = passkey_now.get(relay_distance)
+                check = {
+                    "global_step": global_step,
+                    "step_in_window": step_in_window,
+                    "ppl": ppl_now,
+                    "passkey": {str(k): v for k, v in passkey_now.items()},
+                    "relay_distance": relay_distance,
+                    "relay_accuracy": success_acc,
+                }
+                checks.append(check)
+                print(f"  [check] window={window} step_in_window={step_in_window} ppl={ppl_now:.3f} "
+                      f"relay@{relay_distance}={success_acc} passkey={check['passkey']}")
+                if use_wandb:
+                    wandb.log(
+                        {
+                            "check/window": window,
+                            "check/ppl": ppl_now,
+                            "check/relay_accuracy": success_acc,
+                            **{f"check/passkey_dist_{d}": v for d, v in passkey_now.items()},
+                        },
+                        step=global_step,
+                    )
+
+                if success_acc is not None and success_acc >= args.success_threshold:
+                    outcome = "advanced"
+                    break
+                if step_in_window >= args.max_steps_per_window:
+                    outcome = "gave_up"
+                    break
+
         stage_distances = distances_for_window(window)
-        passkey_now = passkey_retrieval_eval(
-            student, setup.tokenizer, args.device, distances=stage_distances, num_samples=5
-        )
         stage_result = {
             "window": window,
             "global_step": global_step,
-            "ppl": ppl_now,
-            "passkey": {str(k): v for k, v in passkey_now.items()},
+            "outcome": outcome,
+            "steps_taken": step_in_window,
+            "relay_distance": relay_distance,
+            "checks": checks,
             "passkey_teacher_ref": {str(d): history["teacher_baseline"]["passkey"].get(str(d)) for d in stage_distances},
             "train_loss": stage_loss,
         }
         history["stages"].append(stage_result)
-        print(f"  window={window} ppl={ppl_now:.3f} passkey={stage_result['passkey']}")
+        print(f"  window={window} outcome={outcome} steps_taken={step_in_window}")
         if use_wandb:
-            wandb.log(
-                {
-                    "stage/window": window,
-                    "stage/ppl": ppl_now,
-                    **{f"stage/passkey_dist_{d}": v for d, v in passkey_now.items()},
-                    **{
-                        f"stage/passkey_teacher_ref_dist_{d}": v
-                        for d, v in stage_result["passkey_teacher_ref"].items()
-                    },
-                },
-                step=global_step,
-            )
+            wandb.log({"stage/window": window, "stage/outcome": outcome, "stage/steps_taken": step_in_window}, step=global_step)
 
         trainer.save_checkpoint(out_dir / f"window_{window}")
         dump_history()
+
+        if outcome == "gave_up":
+            print(f"Stopping: window={window} never reached success_threshold within max_steps_per_window. "
+                  f"This is the relay-capability boundary.")
+            break
+
+        next_window = max(args.window_min, round(window * args.window_decay))
+        if next_window == window:
+            print("Stopping: window already at window_min.")
+            break
+        window = next_window
 
     print(f"Curriculum complete. Metrics in {args.metrics_out}, checkpoints under {out_dir}")
     if use_wandb:
